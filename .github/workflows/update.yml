@@ -9,26 +9,19 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装Python
+      - uses: actions/checkout@v4
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: 安装依赖
-        run: |
-          pip install requests beautifulsoup4 playwright
-          playwright install chromium
-
-      - name: 运行抓取脚本
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+      - name: Run script
         run: python main.py
-
-      - name: 提交并推送更新
+      - name: Commit and push
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git config user.name github-actions
+          git config user.email github-actions@github.com
           git add output/
-          git diff --staged --quiet || git commit -m "自动更新IPTV源 $(date '+%Y-%m-%d %H:%M')"
+          git diff --staged --quiet || git commit -m "Auto update $(date '+%Y-%m-%d %H:%M')"
           git push

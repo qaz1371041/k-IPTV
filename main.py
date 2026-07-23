@@ -1,24 +1,21 @@
 import os
 import re
-import random
-import asyncio
-from urllib.parse import urljoin
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+import time
 import requests
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ==================== 配置 ====================
 BASE_URL = "https://iptv.cqshushu.com/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
 TIMEOUT = 5               # 检测超时（秒）
 MAX_WORKERS = 20          # 并发检测线程数
 OUTPUT_DIR = "output"
 
-# ==================== 分类关键词 ====================
+# ---------- 分类关键词 ----------
 CCTV_KEYWORDS = ["cctv", "央视", "中央电视", "CCTV-", "CCTV"]
 
-# 卫视映射（英文键名，便于阅读）
 SATELLITE_TV = {
     "湖南卫视": ["湖南卫视", "芒果台"],
     "浙江卫视": ["浙江卫视", "中国蓝"],
@@ -58,112 +55,84 @@ SATELLITE_TV = {
 }
 
 def classify_channel(name: str) -> str:
-    """根据频道名自动归类（返回分类名称）"""
+    """根据频道名自动归类"""
     name_lower = name.lower()
-    # 1. 央视
     for kw in CCTV_KEYWORDS:
         if kw in name_lower:
             return "央视"
-    # 2. 卫视
     for tv_name, keywords in SATELLITE_TV.items():
         for kw in keywords:
             if kw in name:
                 return tv_name
-    # 3. 其他
     return "其他"
 
 
-# ==================== 抓取所有 IP（含分页） ====================
-async def fetch_all_ips():
-    """使用Playwright获取所有IP的token和元信息（遍历所有分页）"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(BASE_URL, wait_until="networkidle")
-        await page.wait_for_selector("table.iptv-table tbody tr", timeout=30000)
+# ---------- 抓取首页分页 ----------
+def get_page(page=1, t='all', province='all', limit=6):
+    params = {'t': t, 'province': province, 'limit': limit, 'page': page}
+    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    return resp.text
 
-        all_ips = []
-        page_num = 1
-        while True:
-            print(f"  正在抓取第 {page_num} 页...")
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            rows = soup.select("table.iptv-table tbody tr")
-            if not rows:
-                break
-
-            for row in rows:
-                cells = row.find_all("td")
-                if len(cells) < 6:
-                    continue
-                ip_cell = cells[0]
-                a_tag = ip_cell.find("a")
-                if not a_tag or "onclick" not in a_tag.attrs:
-                    continue
-                onclick = a_tag["onclick"]
-                match = re.search(r"gotoIP\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", onclick)
-                if not match:
-                    continue
-                token, iptype = match.groups()
-                all_ips.append({
-                    "ip": a_tag.get_text(strip=True),
-                    "token": token,
-                    "type": iptype,
-                    "province": cells[2].get_text(strip=True) if len(cells) > 2 else "",
-                    "count": cells[1].get_text(strip=True) if len(cells) > 1 else "0",
-                })
-
-            # 检查是否有下一页
-            next_btn = soup.select_one("a.pagination-btn:contains('下一页')")
-            if not next_btn:
-                break
-            await page.click("a.pagination-btn:contains('下一页')")
-            await page.wait_for_timeout(2000 + random.randint(500, 1500))  # 随机延迟
-            page_num += 1
-
-        await browser.close()
-        return all_ips
+def parse_ip_list(html):
+    """解析HTML表格，返回IP信息列表"""
+    soup = BeautifulSoup(html, 'html.parser')
+    rows = soup.select("table.iptv-table tbody tr")
+    ips = []
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 6:
+            continue
+        ip_cell = cells[0]
+        a_tag = ip_cell.find("a")
+        if not a_tag or "onclick" not in a_tag.attrs:
+            continue
+        onclick = a_tag["onclick"]
+        match = re.search(r"gotoIP\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", onclick)
+        if not match:
+            continue
+        token, iptype = match.groups()
+        ips.append({
+            "ip": a_tag.get_text(strip=True),
+            "token": token,
+            "type": iptype,
+            "province": cells[2].get_text(strip=True),
+            "count": cells[1].get_text(strip=True),
+        })
+    return ips
 
 
-# ==================== 获取单个IP的频道列表 ====================
-async def fetch_channels(token: str, iptype: str):
-    """通过token获取该IP下的所有频道（使用Playwright）"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        url = f"{BASE_URL}iptv_channel.php?token={token}&type={iptype}"
-        await page.goto(url, wait_until="networkidle")
-        await page.wait_for_selector(".channels-table tbody tr", timeout=15000)
-
-        html = await page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        channels = []
-        rows = soup.select(".channels-table tbody tr")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) < 2:
-                continue
-            name = cells[0].get_text(strip=True)
-            # 播放地址可能在 <a> 标签中
-            a_tag = cells[1].find("a")
-            url = a_tag.get("href") if a_tag else cells[1].get_text(strip=True)
-            if url and ("http" in url or "m3u8" in url or "ts" in url):
-                channels.append({"name": name, "url": url})
-
-        await browser.close()
-        return channels
+# ---------- 获取IP详情频道 ----------
+def get_channels(token, iptype):
+    url = f"{BASE_URL}iptv_channel.php?token={token}&type={iptype}"
+    resp = requests.get(url, headers=HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    channels = []
+    # 尝试常见选择器
+    rows = soup.select(".channels-table tbody tr")
+    if not rows:
+        rows = soup.select("table tbody tr")
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+        name = cells[0].get_text(strip=True)
+        a_tag = cells[1].find("a")
+        url = a_tag.get("href") if a_tag else cells[1].get_text(strip=True)
+        if url and ("http" in url or "m3u8" in url or "ts" in url):
+            channels.append({"name": name, "url": url})
+    return channels
 
 
-# ==================== 检测URL可用性 ====================
+# ---------- 检测URL可用性 ----------
 def check_url(url: str) -> bool:
-    """检测单个URL是否可播放（支持m3u8/ts/flv等）"""
     try:
         r = requests.head(url, timeout=TIMEOUT, allow_redirects=True)
         if r.status_code == 200:
             content_type = r.headers.get("Content-Type", "")
             if any(x in content_type for x in ["video", "mpegurl", "audio"]):
                 return True
-        # HEAD不可靠时尝试GET少量数据
         r = requests.get(url, timeout=TIMEOUT, stream=True)
         if r.status_code == 200:
             chunk = next(r.iter_content(1024), None)
@@ -174,14 +143,11 @@ def check_url(url: str) -> bool:
     return False
 
 
-# ==================== 处理单个IP ====================
-async def process_ip(ip_info):
-    """处理单个IP：获取频道→检测→分类，返回有效频道列表"""
-    channels = await fetch_channels(ip_info["token"], ip_info["type"])
+# ---------- 处理单个IP ----------
+def process_ip(ip_info):
+    channels = get_channels(ip_info["token"], ip_info["type"])
     if not channels:
         return None
-
-    # 并发检测
     valid = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_ch = {executor.submit(check_url, ch["url"]): ch for ch in channels}
@@ -194,10 +160,8 @@ async def process_ip(ip_info):
                     valid.append(ch)
             except:
                 pass
-
     if not valid:
         return None
-
     return {
         "ip": ip_info["ip"],
         "type": ip_info["type"],
@@ -206,19 +170,16 @@ async def process_ip(ip_info):
     }
 
 
-# ==================== 生成播放列表 ====================
+# ---------- 生成播放列表 ----------
 def generate_playlists(all_results):
-    """生成M3U和TXT播放列表（按分类分组）"""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # 按分类汇总
     categories = {}
     for result in all_results:
         for ch in result["channels"]:
             cat = ch["category"]
             categories.setdefault(cat, []).append(ch)
 
-    # 生成主M3U（含分组）
+    # 主M3U（带分组）
     m3u_path = os.path.join(OUTPUT_DIR, "iptv_all.m3u")
     with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -228,7 +189,7 @@ def generate_playlists(all_results):
                 f.write(f'#EXTINF:-1 tvg-logo="" group-title="{cat}",{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
 
-    # 生成每个分类的独立M3U
+    # 各分类独立M3U
     for cat, channels in categories.items():
         cat_path = os.path.join(OUTPUT_DIR, f"{cat}.m3u")
         with open(cat_path, "w", encoding="utf-8") as f:
@@ -237,7 +198,7 @@ def generate_playlists(all_results):
                 f.write(f'#EXTINF:-1,{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
 
-    # 生成TXT（每行一个URL）
+    # TXT格式
     txt_path = os.path.join(OUTPUT_DIR, "iptv_all.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         for cat, channels in categories.items():
@@ -245,33 +206,40 @@ def generate_playlists(all_results):
             for ch in channels:
                 f.write(f"{ch['url']}\n")
 
-    print("\n✅ 播放列表已生成：")
-    print(f"   📁 {OUTPUT_DIR}/")
-    total = sum(len(v) for v in categories.values())
-    print(f"   📊 总计 {total} 个有效频道")
-    for cat, channels in categories.items():
-        print(f"   - {cat}: {len(channels)} 个")
+    print(f"✅ 生成完成，总计 {sum(len(v) for v in categories.values())} 个有效频道")
 
 
-# ==================== 主函数 ====================
-async def main():
-    print("🚀 开始抓取所有 IP 列表...")
-    all_ips = await fetch_all_ips()
-    print(f"📡 共发现 {len(all_ips)} 个 IP")
+# ---------- 主函数 ----------
+def main():
+    print("🚀 开始抓取所有分页IP...")
+    all_ips = []
+    page = 1
+    while True:
+        print(f"  抓取第 {page} 页...")
+        html = get_page(page=page)
+        ips = parse_ip_list(html)
+        if not ips:
+            break
+        all_ips.extend(ips)
+        soup = BeautifulSoup(html, 'html.parser')
+        next_link = soup.select_one("a.pagination-btn:contains('下一页')")
+        if not next_link:
+            break
+        page += 1
 
+    print(f"📡 共发现 {len(all_ips)} 个IP")
     all_results = []
     for idx, ip_info in enumerate(all_ips, 1):
         print(f"⏳ 处理 {idx}/{len(all_ips)}: {ip_info['ip']} ({ip_info.get('province', '未知')})")
-        result = await process_ip(ip_info)
+        result = process_ip(ip_info)
         if result:
             all_results.append(result)
             print(f"   ✅ 有效频道: {len(result['channels'])} 个")
         else:
-            print(f"   ❌ 无有效频道，已跳过")
+            print(f"   ❌ 无有效频道")
 
-    print(f"\n📊 有效 IP 数量: {len(all_results)}")
     generate_playlists(all_results)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

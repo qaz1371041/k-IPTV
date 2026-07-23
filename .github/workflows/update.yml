@@ -2,7 +2,7 @@ name: 每日抓取IPTV源
 
 on:
   schedule:
-    - cron: '0 6,18 * * *'   # 每天6:00和18:00
+    - cron: '0 6,18 * * *'
   workflow_dispatch:
 
 jobs:

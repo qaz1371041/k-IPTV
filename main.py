@@ -5,31 +5,22 @@ import os
 import re
 import time
 import random
-import cloudscraper  # 替代 requests，自动处理 Cloudflare 等
+import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
 
 # ==================== 配置 ====================
 BASE_URL = "https://iptv.cqshushu.com/"
 OUTPUT_DIR = "output"
-TIMEOUT = 5                # 检测超时（秒）
-MAX_WORKERS = 20           # 并发检测线程数
-RETRY_TIMES = 3            # 请求重试次数
+TIMEOUT = 5
+MAX_WORKERS = 20
+RETRY_TIMES = 3
+REQUEST_DELAY = (1, 3)          # 请求间隔随机范围（秒）
 
-# ==================== 创建 cloudscraper 会话（自动处理反爬） ====================
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'mobile': False,
-        'custom': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-    }
-)
-
-# 额外请求头（加强）
-scraper.headers.update({
+# ==================== 超级真实的请求头 ====================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
@@ -41,9 +32,26 @@ scraper.headers.update({
     "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0",
     "Referer": "https://iptv.cqshushu.com/",
-})
+}
 
-# ==================== 分类映射（保持不变） ====================
+# 创建会话
+session = requests.Session()
+session.headers.update(HEADERS)
+
+# ==================== 代理池（如果仍 403，可启用） ====================
+# 免费代理列表（示例，实际可从 https://free-proxy-list.net/ 获取）
+PROXY_LIST = [
+    # "http://12.34.56.78:8080",
+    # "http://98.76.54.32:3128",
+]
+USE_PROXY = False  # 默认关闭，如需启用设为 True，并填充 PROXY_LIST
+
+def get_proxy():
+    if USE_PROXY and PROXY_LIST:
+        return {"http": random.choice(PROXY_LIST), "https": random.choice(PROXY_LIST)}
+    return None
+
+# ==================== 分类映射 ====================
 CCTV_KEYWORDS = ["cctv", "央视", "中央电视", "CCTV-", "CCTV"]
 SATELLITE_TV = {
     "湖南卫视": ["湖南卫视", "芒果台"],
@@ -94,11 +102,14 @@ def classify_channel(name: str) -> str:
                 return tv_name
     return "其他"
 
-# ==================== 带重试的请求函数 ====================
+# ==================== 带重试和代理的请求 ====================
 def fetch_url(url, params=None, retries=RETRY_TIMES, delay=2):
     for attempt in range(retries):
         try:
-            resp = scraper.get(url, params=params, timeout=15)
+            proxy = get_proxy()
+            resp = session.get(url, params=params, timeout=15, proxies=proxy)
+            if resp.status_code == 403:
+                raise Exception(f"403 Forbidden")
             resp.raise_for_status()
             return resp.text
         except Exception as e:
@@ -109,38 +120,54 @@ def fetch_url(url, params=None, retries=RETRY_TIMES, delay=2):
                 raise
     return None
 
-# ==================== 抓取首页分页 ====================
-def get_page(page=1, t='all', province='all', limit=6):
-    params = {'t': t, 'province': province, 'limit': limit, 'page': page}
-    return fetch_url(BASE_URL, params=params)
+# ==================== 抓取所有分页 IP ====================
+def get_all_ips():
+    all_ips = []
+    page = 1
+    while True:
+        print(f"  抓取第 {page} 页...")
+        try:
+            params = {'t': 'all', 'province': 'all', 'limit': 6, 'page': page}
+            html = fetch_url(BASE_URL, params=params)
+            if not html:
+                break
+            soup = BeautifulSoup(html, 'html.parser')
+            rows = soup.select("table.iptv-table tbody tr")
+            if not rows:
+                print("  当前页无IP，停止分页。")
+                break
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) < 6:
+                    continue
+                ip_cell = cells[0]
+                a_tag = ip_cell.find("a")
+                if not a_tag or "onclick" not in a_tag.attrs:
+                    continue
+                onclick = a_tag["onclick"]
+                match = re.search(r"gotoIP\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", onclick)
+                if not match:
+                    continue
+                token, iptype = match.groups()
+                all_ips.append({
+                    "ip": a_tag.get_text(strip=True),
+                    "token": token,
+                    "type": iptype,
+                    "province": cells[2].get_text(strip=True),
+                    "count": cells[1].get_text(strip=True),
+                })
+            # 检查下一页
+            next_link = soup.select_one("a.pagination-btn:contains('下一页')")
+            if not next_link:
+                break
+            page += 1
+            time.sleep(random.uniform(*REQUEST_DELAY))
+        except Exception as e:
+            print(f"  抓取第 {page} 页失败: {e}")
+            break
+    return all_ips
 
-def parse_ip_list(html):
-    soup = BeautifulSoup(html, 'html.parser')
-    rows = soup.select("table.iptv-table tbody tr")
-    ips = []
-    for row in rows:
-        cells = row.find_all("td")
-        if len(cells) < 6:
-            continue
-        ip_cell = cells[0]
-        a_tag = ip_cell.find("a")
-        if not a_tag or "onclick" not in a_tag.attrs:
-            continue
-        onclick = a_tag["onclick"]
-        match = re.search(r"gotoIP\s*\(\s*'([^']+)'\s*,\s*'([^']+)'\s*\)", onclick)
-        if not match:
-            continue
-        token, iptype = match.groups()
-        ips.append({
-            "ip": a_tag.get_text(strip=True),
-            "token": token,
-            "type": iptype,
-            "province": cells[2].get_text(strip=True),
-            "count": cells[1].get_text(strip=True),
-        })
-    return ips
-
-# ==================== 获取IP详情频道 ====================
+# ==================== 获取频道列表 ====================
 def get_channels(token, iptype):
     url = f"{BASE_URL}iptv_channel.php?token={token}&type={iptype}"
     html = fetch_url(url)
@@ -148,6 +175,7 @@ def get_channels(token, iptype):
         return []
     soup = BeautifulSoup(html, 'html.parser')
     channels = []
+    # 兼容多种表格结构
     rows = soup.select(".channels-table tbody tr")
     if not rows:
         rows = soup.select("table tbody tr")
@@ -158,11 +186,12 @@ def get_channels(token, iptype):
         name = cells[0].get_text(strip=True)
         a_tag = cells[1].find("a")
         url = a_tag.get("href") if a_tag else cells[1].get_text(strip=True)
-        if url and ("http" in url or "m3u8" in url or "ts" in url):
+        # 过滤出播放地址
+        if url and ("http" in url or "m3u8" in url or "ts" in url or "flv" in url):
             channels.append({"name": name, "url": url})
     return channels
 
-# ==================== 检测URL可用性 ====================
+# ==================== 检测 URL 可用性 ====================
 def check_url(url: str) -> bool:
     try:
         r = requests.head(url, timeout=TIMEOUT, allow_redirects=True)
@@ -170,6 +199,7 @@ def check_url(url: str) -> bool:
             content_type = r.headers.get("Content-Type", "")
             if any(x in content_type for x in ["video", "mpegurl", "audio"]):
                 return True
+        # 部分服务器不支持 HEAD，改用 GET 少量数据
         r = requests.get(url, timeout=TIMEOUT, stream=True)
         if r.status_code == 200:
             chunk = next(r.iter_content(1024), None)
@@ -179,7 +209,7 @@ def check_url(url: str) -> bool:
         pass
     return False
 
-# ==================== 处理单个IP ====================
+# ==================== 处理单个 IP ====================
 def process_ip(ip_info):
     channels = get_channels(ip_info["token"], ip_info["type"])
     if not channels:
@@ -191,7 +221,6 @@ def process_ip(ip_info):
             ch = future_to_ch[future]
             try:
                 if future.result():
-                    ch["valid"] = True
                     ch["category"] = classify_channel(ch["name"])
                     valid.append(ch)
             except:
@@ -214,7 +243,7 @@ def generate_playlists(all_results):
             cat = ch["category"]
             categories.setdefault(cat, []).append(ch)
 
-    # 主M3U
+    # 主 M3U（带分组）
     m3u_path = os.path.join(OUTPUT_DIR, "iptv_all.m3u")
     with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -224,7 +253,7 @@ def generate_playlists(all_results):
                 f.write(f'#EXTINF:-1 tvg-logo="" group-title="{cat}",{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
 
-    # 各分类独立M3U
+    # 各分类独立 M3U
     for cat, channels in categories.items():
         cat_path = os.path.join(OUTPUT_DIR, f"{cat}.m3u")
         with open(cat_path, "w", encoding="utf-8") as f:
@@ -233,7 +262,7 @@ def generate_playlists(all_results):
                 f.write(f'#EXTINF:-1,{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
 
-    # TXT
+    # TXT 格式
     txt_path = os.path.join(OUTPUT_DIR, "iptv_all.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         for cat, channels in categories.items():
@@ -248,31 +277,11 @@ def generate_playlists(all_results):
 
 # ==================== 主函数 ====================
 def main():
-    print("🚀 开始抓取所有分页IP...")
-    all_ips = []
-    page = 1
-    while True:
-        print(f"  抓取第 {page} 页...")
-        try:
-            html = get_page(page=page)
-            ips = parse_ip_list(html)
-            if not ips:
-                print("  当前页无IP，停止分页。")
-                break
-            all_ips.extend(ips)
-            soup = BeautifulSoup(html, 'html.parser')
-            next_link = soup.select_one("a.pagination-btn:contains('下一页')")
-            if not next_link:
-                break
-            page += 1
-            time.sleep(random.uniform(1, 3))
-        except Exception as e:
-            print(f"  抓取第 {page} 页失败: {e}")
-            break
-
-    print(f"📡 共发现 {len(all_ips)} 个IP")
+    print("🚀 开始抓取所有分页 IP...")
+    all_ips = get_all_ips()
+    print(f"📡 共发现 {len(all_ips)} 个 IP")
     if not all_ips:
-        print("❌ 未获取到任何IP，退出。")
+        print("❌ 未获取到任何 IP，退出。")
         return
 
     all_results = []

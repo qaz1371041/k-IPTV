@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
 import re
 import time
@@ -8,6 +11,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== 配置 ====================
 BASE_URL = "https://iptv.cqshushu.com/"
+OUTPUT_DIR = "output"
+TIMEOUT = 5                # 检测超时（秒）
+MAX_WORKERS = 20           # 并发检测线程数
+RETRY_TIMES = 3            # 请求重试次数
+
+# ==================== 真实的浏览器请求头 ====================
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -20,13 +29,10 @@ HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0",
+    "Referer": "https://iptv.cqshushu.com/",   # 关键：告诉服务器请求来源
 }
-TIMEOUT = 5                # 检测超时（秒）
-MAX_WORKERS = 20           # 并发检测线程数
-OUTPUT_DIR = "output"      # 输出目录
-RETRY_TIMES = 3            # 请求重试次数
 
-# 创建全局 Session
+# 创建会话
 session = requests.Session()
 session.headers.update(HEADERS)
 

@@ -5,7 +5,7 @@ import os
 import re
 import time
 import random
-import requests
+import cloudscraper  # 替代 requests，自动处理 Cloudflare 等
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -16,9 +16,20 @@ TIMEOUT = 5                # 检测超时（秒）
 MAX_WORKERS = 20           # 并发检测线程数
 RETRY_TIMES = 3            # 请求重试次数
 
-# ==================== 真实的浏览器请求头 ====================
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+# ==================== 创建 cloudscraper 会话（自动处理反爬） ====================
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'mobile': False,
+        'custom': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    }
+)
+
+# 额外请求头（加强）
+scraper.headers.update({
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
@@ -29,16 +40,11 @@ HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0",
-    "Referer": "https://iptv.cqshushu.com/",   # 关键：告诉服务器请求来源
-}
+    "Referer": "https://iptv.cqshushu.com/",
+})
 
-# 创建会话
-session = requests.Session()
-session.headers.update(HEADERS)
-
-# ==================== 分类映射 ====================
+# ==================== 分类映射（保持不变） ====================
 CCTV_KEYWORDS = ["cctv", "央视", "中央电视", "CCTV-", "CCTV"]
-
 SATELLITE_TV = {
     "湖南卫视": ["湖南卫视", "芒果台"],
     "浙江卫视": ["浙江卫视", "中国蓝"],
@@ -78,7 +84,6 @@ SATELLITE_TV = {
 }
 
 def classify_channel(name: str) -> str:
-    """根据频道名自动归类"""
     name_lower = name.lower()
     for kw in CCTV_KEYWORDS:
         if kw in name_lower:
@@ -93,10 +98,10 @@ def classify_channel(name: str) -> str:
 def fetch_url(url, params=None, retries=RETRY_TIMES, delay=2):
     for attempt in range(retries):
         try:
-            resp = session.get(url, params=params, timeout=15)
+            resp = scraper.get(url, params=params, timeout=15)
             resp.raise_for_status()
             return resp.text
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             print(f"  请求失败 (尝试 {attempt+1}/{retries}): {e}")
             if attempt < retries - 1:
                 time.sleep(delay * (attempt + 1))
@@ -110,7 +115,6 @@ def get_page(page=1, t='all', province='all', limit=6):
     return fetch_url(BASE_URL, params=params)
 
 def parse_ip_list(html):
-    """解析HTML表格，返回IP信息列表"""
     soup = BeautifulSoup(html, 'html.parser')
     rows = soup.select("table.iptv-table tbody tr")
     ips = []
@@ -144,7 +148,6 @@ def get_channels(token, iptype):
         return []
     soup = BeautifulSoup(html, 'html.parser')
     channels = []
-    # 尝试常见选择器
     rows = soup.select(".channels-table tbody tr")
     if not rows:
         rows = soup.select("table tbody tr")
@@ -211,7 +214,7 @@ def generate_playlists(all_results):
             cat = ch["category"]
             categories.setdefault(cat, []).append(ch)
 
-    # 主M3U（带分组）
+    # 主M3U
     m3u_path = os.path.join(OUTPUT_DIR, "iptv_all.m3u")
     with open(m3u_path, "w", encoding="utf-8") as f:
         f.write("#EXTM3U\n")
@@ -230,7 +233,7 @@ def generate_playlists(all_results):
                 f.write(f'#EXTINF:-1,{ch["name"]}\n')
                 f.write(f'{ch["url"]}\n')
 
-    # TXT格式
+    # TXT
     txt_path = os.path.join(OUTPUT_DIR, "iptv_all.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         for cat, channels in categories.items():
@@ -262,7 +265,7 @@ def main():
             if not next_link:
                 break
             page += 1
-            time.sleep(random.uniform(1, 3))  # 随机延迟
+            time.sleep(random.uniform(1, 3))
         except Exception as e:
             print(f"  抓取第 {page} 页失败: {e}")
             break

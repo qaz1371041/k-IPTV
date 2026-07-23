@@ -1,19 +1,36 @@
 import os
 import re
 import time
+import random
 import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ==================== 配置 ====================
 BASE_URL = "https://iptv.cqshushu.com/"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
 }
-TIMEOUT = 5               # 检测超时（秒）
-MAX_WORKERS = 20          # 并发检测线程数
-OUTPUT_DIR = "output"
+TIMEOUT = 5                # 检测超时（秒）
+MAX_WORKERS = 20           # 并发检测线程数
+OUTPUT_DIR = "output"      # 输出目录
+RETRY_TIMES = 3            # 请求重试次数
 
-# ---------- 分类关键词 ----------
+# 创建全局 Session
+session = requests.Session()
+session.headers.update(HEADERS)
+
+# ==================== 分类映射 ====================
 CCTV_KEYWORDS = ["cctv", "央视", "中央电视", "CCTV-", "CCTV"]
 
 SATELLITE_TV = {
@@ -66,13 +83,25 @@ def classify_channel(name: str) -> str:
                 return tv_name
     return "其他"
 
+# ==================== 带重试的请求函数 ====================
+def fetch_url(url, params=None, retries=RETRY_TIMES, delay=2):
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            return resp.text
+        except requests.exceptions.RequestException as e:
+            print(f"  请求失败 (尝试 {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))
+            else:
+                raise
+    return None
 
-# ---------- 抓取首页分页 ----------
+# ==================== 抓取首页分页 ====================
 def get_page(page=1, t='all', province='all', limit=6):
     params = {'t': t, 'province': province, 'limit': limit, 'page': page}
-    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=10)
-    resp.raise_for_status()
-    return resp.text
+    return fetch_url(BASE_URL, params=params)
 
 def parse_ip_list(html):
     """解析HTML表格，返回IP信息列表"""
@@ -101,13 +130,13 @@ def parse_ip_list(html):
         })
     return ips
 
-
-# ---------- 获取IP详情频道 ----------
+# ==================== 获取IP详情频道 ====================
 def get_channels(token, iptype):
     url = f"{BASE_URL}iptv_channel.php?token={token}&type={iptype}"
-    resp = requests.get(url, headers=HEADERS, timeout=10)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, 'html.parser')
+    html = fetch_url(url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, 'html.parser')
     channels = []
     # 尝试常见选择器
     rows = soup.select(".channels-table tbody tr")
@@ -124,8 +153,7 @@ def get_channels(token, iptype):
             channels.append({"name": name, "url": url})
     return channels
 
-
-# ---------- 检测URL可用性 ----------
+# ==================== 检测URL可用性 ====================
 def check_url(url: str) -> bool:
     try:
         r = requests.head(url, timeout=TIMEOUT, allow_redirects=True)
@@ -142,8 +170,7 @@ def check_url(url: str) -> bool:
         pass
     return False
 
-
-# ---------- 处理单个IP ----------
+# ==================== 处理单个IP ====================
 def process_ip(ip_info):
     channels = get_channels(ip_info["token"], ip_info["type"])
     if not channels:
@@ -169,8 +196,7 @@ def process_ip(ip_info):
         "channels": valid
     }
 
-
-# ---------- 生成播放列表 ----------
+# ==================== 生成播放列表 ====================
 def generate_playlists(all_results):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     categories = {}
@@ -206,40 +232,55 @@ def generate_playlists(all_results):
             for ch in channels:
                 f.write(f"{ch['url']}\n")
 
-    print(f"✅ 生成完成，总计 {sum(len(v) for v in categories.values())} 个有效频道")
+    total = sum(len(v) for v in categories.values())
+    print(f"✅ 生成完成，总计 {total} 个有效频道")
+    for cat, channels in categories.items():
+        print(f"   - {cat}: {len(channels)} 个")
 
-
-# ---------- 主函数 ----------
+# ==================== 主函数 ====================
 def main():
     print("🚀 开始抓取所有分页IP...")
     all_ips = []
     page = 1
     while True:
         print(f"  抓取第 {page} 页...")
-        html = get_page(page=page)
-        ips = parse_ip_list(html)
-        if not ips:
+        try:
+            html = get_page(page=page)
+            ips = parse_ip_list(html)
+            if not ips:
+                print("  当前页无IP，停止分页。")
+                break
+            all_ips.extend(ips)
+            soup = BeautifulSoup(html, 'html.parser')
+            next_link = soup.select_one("a.pagination-btn:contains('下一页')")
+            if not next_link:
+                break
+            page += 1
+            time.sleep(random.uniform(1, 3))  # 随机延迟
+        except Exception as e:
+            print(f"  抓取第 {page} 页失败: {e}")
             break
-        all_ips.extend(ips)
-        soup = BeautifulSoup(html, 'html.parser')
-        next_link = soup.select_one("a.pagination-btn:contains('下一页')")
-        if not next_link:
-            break
-        page += 1
 
     print(f"📡 共发现 {len(all_ips)} 个IP")
+    if not all_ips:
+        print("❌ 未获取到任何IP，退出。")
+        return
+
     all_results = []
     for idx, ip_info in enumerate(all_ips, 1):
         print(f"⏳ 处理 {idx}/{len(all_ips)}: {ip_info['ip']} ({ip_info.get('province', '未知')})")
-        result = process_ip(ip_info)
-        if result:
-            all_results.append(result)
-            print(f"   ✅ 有效频道: {len(result['channels'])} 个")
-        else:
-            print(f"   ❌ 无有效频道")
+        try:
+            result = process_ip(ip_info)
+            if result:
+                all_results.append(result)
+                print(f"   ✅ 有效频道: {len(result['channels'])} 个")
+            else:
+                print(f"   ❌ 无有效频道")
+        except Exception as e:
+            print(f"   ❌ 处理失败: {e}")
+        time.sleep(random.uniform(0.5, 1.5))
 
     generate_playlists(all_results)
-
 
 if __name__ == "__main__":
     main()
